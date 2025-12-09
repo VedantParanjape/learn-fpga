@@ -82,11 +82,12 @@ module FemtoRV32(
    wire isStore   =  (instr[6:2] == 5'b01000); // mem[rs1+Simm] <- rs2
    wire isALUreg  =  (instr[6:2] == 5'b01100); // rd <- rs1 OP rs2
    wire isSYSTEM  =  (instr[6:2] == 5'b11100); // rd <- cycles
-   wire isJAL     =  instr[3]; // (instr[6:2] == 5'b11011); // rd <- PC+4; PC<-PC+Jimm
+   wire isJAL     =  (instr[6:2] == 5'b11011); // rd <- PC+4; PC<-PC+Jimm
    wire isJALR    =  (instr[6:2] == 5'b11001); // rd <- PC+4; PC<-rs1+Iimm
    wire isLUI     =  (instr[6:2] == 5'b01101); // rd <- Uimm
    wire isAUIPC   =  (instr[6:2] == 5'b00101); // rd <- PC + Uimm
    wire isBranch  =  (instr[6:2] == 5'b11000); // if(rs1 OP rs2) PC<-PC+Bimm
+   wire isTEEMode =  (instr[6:2] == 5'b00111); // Check TEEEnter/Exit instr
 
    wire isALU = isALUimm | isALUreg;
 
@@ -116,7 +117,7 @@ module FemtoRV32(
    // Second ALU source, depends on opcode:
    //    ALUreg, Branch:     rs2
    //    ALUimm, Load, JALR: Iimm
-   wire [31:0] aluIn2 = isALUreg | isBranch ? rs2 : Iimm;
+   wire [31:0] aluIn2 = isALUreg | isBranch | isTEEMode ? rs2 : Iimm;
 
    reg  [31:0] aluReg;       // The internal register of the ALU, used by shift.
    reg  [4:0]  aluShamt;     // Current shift amount.
@@ -216,8 +217,13 @@ module FemtoRV32(
    // internal address registers and cycles counter may have less than 
    // 32 bits, so we deactivate width test for mem_addr and writeBackData
 
+   // 0x300000 - 0x3FFFFF is the address range for the TEE memory
+   // address space
+   reg [0:0] tee_mem_addr_mode;
+   wire tee_mem_addr_scope;
+   assign tee_mem_addr_scope = loadstore_addr[21] && loadstore_addr[20];
    assign mem_addr = state[WAIT_INSTR_bit] | state[FETCH_INSTR_bit] ?
-		     PC : loadstore_addr ;
+		     PC : ((tee_mem_addr_scope && !tee_mem_addr_mode) ? 32'h400004 : loadstore_addr);
 
    /***************************************************************************/
    // The value written back to the register file.
@@ -266,7 +272,7 @@ module FemtoRV32(
 
    // STORE
 
-   assign mem_wdata[ 7: 0] = rs2[7:0];
+   assign mem_wdata[ 7: 0] = (tee_mem_addr_scope && !tee_mem_addr_mode) ? 8'b1111 : rs2[7:0];
    assign mem_wdata[15: 8] = loadstore_addr[0] ? rs2[7:0]  : rs2[15: 8];
    assign mem_wdata[23:16] = loadstore_addr[1] ? rs2[7:0]  : rs2[23:16];
    assign mem_wdata[31:24] = loadstore_addr[0] ? rs2[7:0]  :
@@ -336,6 +342,7 @@ module FemtoRV32(
       if(!reset) begin
          state      <= WAIT_ALU_OR_MEM; // Just waiting for !mem_wbusy
          PC         <= RESET_ADDR[ADDR_WIDTH-1:0];
+	 tee_mem_addr_mode <= 0;
       end else
 
       // See note [1] at the end of this file.
@@ -346,7 +353,15 @@ module FemtoRV32(
            if(!mem_rbusy) begin // may be high when executing from SPI flash
               rs1 <= registerFile[mem_rdata[19:15]];
               rs2 <= registerFile[mem_rdata[24:20]];
-              instr <= mem_rdata[31:2]; // Bits 0 and 1 are ignored (see
+
+	      // Detect TEE special opcodes
+	      case (mem_rdata)
+		32'h0000007b: tee_mem_addr_mode <= 1;   // TEE_ENTER
+		32'h0000007f: tee_mem_addr_mode <= 0;   // TEE_EXIT
+		default:;
+              endcase
+
+	      instr <= mem_rdata[31:2]; // Bits 0 and 1 are ignored (see
               state <= EXECUTE;         // also the declaration of instr).
            end
         end
